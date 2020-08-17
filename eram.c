@@ -131,10 +131,19 @@
 #include <devioctl.h>
 #include <ntddstor.h>
 #include <ntiologc.h>
+#include <wdm.h>
 #include "eram.h"
 #include "eramum.h"
 #pragma pack(1)
 
+PMDL Mdl;
+PHYSICAL_ADDRESS LowAddress;
+PHYSICAL_ADDRESS HighAddress;
+PHYSICAL_ADDRESS SkipBytes;
+
+LowAddress.QuadPart = 0;
+HighAddress.QuadPart = -1;
+SkipBytes.QuadPart = 0;
 
 
 /* EramCreateClose
@@ -629,7 +638,7 @@ VOID EramUnloadDevice(
 			/* Win32 link release */
 			IoDeleteSymbolicLink(&(pEramExt->Win32Name));
 			/* Win32 name area release */
-			ExFreePool(pEramExt->Win32Name.Buffer);
+			MmFreePagesFromMdl(pEramExt->Win32Name.Buffer);
 			pEramExt->Win32Name.Buffer = NULL;
 		}
 	}
@@ -665,7 +674,7 @@ VOID ResourceRelease(
 	else if (pEramExt->pPageBase != NULL)		/* Memory allocating */
 	{
 		/* memory release */
-		ExFreePool(pEramExt->pPageBase);
+		MmFreePagesFromMdl(pEramExt->pPageBase);
 		pEramExt->pPageBase = NULL;
 	}
 	KdPrint(("Eram ResourceRelease end\n"));
@@ -1562,8 +1571,11 @@ NTSTATUS DriverEntry(
 	/* Get the max length of registry path */
 	RegParam.MaximumLength = (WORD)(pRegPath->Length + sizeof(SUBKEY_WSTRING));
 	/* memory allocation for work */
-	pPool = ExAllocatePool(PagedPool, sizeof(*pFatId) + RegParam.MaximumLength);
-	if (pPool == NULL)		/* allocation failed */
+  Mdl = MmAllocatePagesForMdl(LowAddress,
+                              HighAddress,
+                              SkipBytes,
+                              sizeof(*pFatId) + RegParam.MaximumLength);
+	if (Mdl == NULL)		/* allocation failed */
 	{
 		KdPrint(("Eram ExAllocatePool failed\n"));
 		EramReportEvent(pDrvObj, ERAM_ERROR_WORK_ALLOC_FAILED, NULL);
@@ -1582,7 +1594,7 @@ NTSTATUS DriverEntry(
 		KdPrint(("Eram RtlAppendUnicodeStringToString failed\n"));
 		EramReportEvent(pDrvObj, ERAM_ERROR_REG_KEY_APPEND_FAILED, NULL);
 		/* Release the memory for work */
-		ExFreePool(pPool);
+		MmFreePagesFromMdl(Mdl);
 		/* Return error */
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -1601,7 +1613,7 @@ NTSTATUS DriverEntry(
 	ntStat = EramInitDisk(pDrvObj, pFatId, &RegParam);
 	ASSERT(pPool != NULL);
 	/* Release the memory for work */
-	ExFreePool(pPool);
+	MmFreePagesFromMdl(Mdl);
 	KdPrint(("Eram DriverEntry end\n"));
 	/* 初期化終了 */
 	return ntStat;
@@ -1743,7 +1755,10 @@ NTSTATUS EramInitDisk(
 	/* ERAM Info Settings */
 	pEramExt->bsHiddenSecs = pFatId->BPB_ext.bsHiddenSecs;
 	/* Win32 device name area allocation */
-	pEramExt->Win32Name.Buffer = ExAllocatePool(PagedPool, (sizeof(WIN32_PATH) + sizeof(DEFAULT_DRV)));
+  pEramExt->Win32Name.Buffer =  MmAllocatePagesForMdl(LowAddress,
+                                                               HighAddress,
+                                                               SkipBytes,
+                                                               (sizeof(WIN32_PATH) + sizeof(DEFAULT_DRV)));
 	if (pEramExt->Win32Name.Buffer == NULL)		/* allocation failed */
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_DEVICE_NAME_ALLOC_FAILED, NULL);
@@ -1770,7 +1785,7 @@ NTSTATUS EramInitDisk(
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_CREATE_SYMBOLIC_LINK_FAILED, NULL);
 		/* Win32 name area release */
-		ExFreePool(pEramExt->Win32Name.Buffer);
+		MmFreePagesFromMdl(pEramExt->Win32Name.Buffer);
 		pEramExt->Win32Name.Buffer = NULL;
 	}
 EramInitDiskExit:	/* entry on error */
@@ -1929,8 +1944,10 @@ BOOLEAN OsAlloc(
 	fPool = (pEramExt->uOptflag.Bits.NonPaged != 0) ? NonPagedPool : PagedPool;
 
 	KdPrint(( "Eram Size=%dmb\n" , uMemSize/(1024*1024) ));
-
-	pEramExt->pPageBase = ExAllocatePool(fPool, uMemSize);
+  pEramExt->pPageBase = MmAllocatePagesForMdl(LowAddress,
+                                              HighAddress,
+                                              SkipBytes,
+                                              uMemSize);
 	if (pEramExt->pPageBase == NULL)	/* allocation failed */
 	{
 		KdPrint(("Eram ExAllocatePool failed, %ld bytes, nonpaged=%d\n", uMemSize, (UINT)(pEramExt->uOptflag.Bits.NonPaged)));
@@ -1967,14 +1984,17 @@ VOID CalcAvailSize(
 	{
 		/* memory allocation */
 		uMemSize -= (DISKMINPAGE << PAGE_SIZE_LOG2);
-		pBuf = ExAllocatePool(fPool, uMemSize);
+    pBuf = MmAllocatePagesForMdl(LowAddress,
+                                 HighAddress,
+                                 SkipBytes,
+                                 uMemSize);
 	}
 	if (pBuf == NULL)		/* allocation failed */
 	{
 		return;
 	}
 	/* memory release */
-	ExFreePool(pBuf);
+	MmFreePagesFromMdl(pBuf);
 	/* Limit to about 75% */
 	uMemSize = (uMemSize >> 2) * 3;
 	/* Report the memory amount */
@@ -2136,7 +2156,10 @@ VOID CheckSwitch(
 	#define	REGOPTNUM	(8)
 	#define	REGOPTSIZE	(REGOPTNUM * sizeof(*pParamTable))
 	/* Allocate the memory for inquiry */
-	pParamTable = ExAllocatePool(PagedPool, REGOPTSIZE);
+ 	pParamTable = MmAllocatePagesForMdl(LowAddress,
+                        HighAddress,
+                        SkipBytes,
+                                      REGOPTSIZE);
 	if (pParamTable != NULL)	/* Success */
 	{
 		/* registry confirmation area initialization */
@@ -2179,7 +2202,7 @@ VOID CheckSwitch(
 			bDefault = TRUE;
 		}
 		/* Release the memory for inquiry */
-		ExFreePool(pParamTable);
+		MmFreePagesFromMdl(pParamTable);
 	}
 	if (bDefault != FALSE)	/* Incompletely read */
 	{
@@ -3214,7 +3237,10 @@ BOOLEAN GetExternalStart(
 	static WCHAR		szwNoLowMem[] = L"NOLOWMEM";
 	KdPrint(("Eram GetExternalStart start\n"));
 	uSize = 512 * sizeof(WCHAR);
-	pBuf = ExAllocatePool(PagedPool, uSize);
+  pBuf = MmAllocatePagesForMdl(LowAddress,
+                               HighAddress,
+                               SkipBytes,
+                               uSize);
 	if (pBuf == NULL)		/* allocation failed */
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_OPTION_WORK_ALLOC_FAILED, NULL);
@@ -3235,14 +3261,14 @@ BOOLEAN GetExternalStart(
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_OPTION_GET_FAILED, NULL);
 		/* memory release */
-		ExFreePool(pBuf);
+		MmFreePagesFromMdl(pBuf);
 		return FALSE;
 	}
 	if (uniOption.Length == 0)	/* Without option */
 	{
 		KdPrint(("Eram No startup option\n"));
 		/* memory release */
-		ExFreePool(pBuf);
+		MmFreePagesFromMdl(pBuf);
 		return FALSE;
 	}
 	/* / PAE judgment from physical address */
@@ -3254,7 +3280,7 @@ BOOLEAN GetExternalStart(
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_MAXMEM_NO_OPTION, NULL);
 		/* memory release */
-		ExFreePool(pBuf);
+		MmFreePagesFromMdl(pBuf);
 		return FALSE;
 	}
 	if (uNoLowMem == 0)
@@ -3267,11 +3293,11 @@ BOOLEAN GetExternalStart(
 	{
 		EramReportEvent(pEramExt->pDevObj, ERAM_ERROR_MAXMEM_CAPITAL_FAILED, NULL);
 		/* memory release */
-		ExFreePool(pBuf);
+		MmFreePagesFromMdl(pBuf);
 		return FALSE;
 	}
 	/* memory release */
-	ExFreePool(pBuf);
+	MmFreePagesFromMdl(pBuf);
 	KdPrint(("Eram Start Parse\n"));
 	pwStr = uniOptionUp.Buffer;
 	bStat = FALSE;
